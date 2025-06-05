@@ -4,7 +4,9 @@
 package main
 
 import (
+	"bufio"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -15,16 +17,17 @@ import (
 )
 
 var (
-	uri          = flag.String("uri", "amqp://guest:guest@localhost:5672/", "AMQP URI")
+	uri          = flag.String("uri", "amqp://gpadmin:changeme@localhost:5672/fs_dev", "AMQP URI")
 	exchange     = flag.String("exchange", "test-exchange", "Durable AMQP exchange name")
 	exchangeType = flag.String("exchange-type", "direct", "Exchange type - direct|fanout|topic|x-custom")
 	queue        = flag.String("queue", "test-queue", "Ephemeral AMQP queue name")
 	routingKey   = flag.String("key", "test-key", "AMQP routing key")
-	body         = flag.String("body", "foobar", "Body of message")
 	continuous   = flag.Bool("continuous", false, "Keep publishing messages at a 1msg/sec rate")
 	WarnLog      = log.New(os.Stderr, "[WARNING] ", log.LstdFlags|log.Lmsgprefix)
 	ErrLog       = log.New(os.Stderr, "[ERROR] ", log.LstdFlags|log.Lmsgprefix)
 	Log          = log.New(os.Stdout, "[INFO] ", log.LstdFlags|log.Lmsgprefix)
+	count        = flag.Int("count", 30, "Number of messages to publish")
+	dataFile     = flag.String("data-file", "", "File to read data from (if empty, generates data on the fly)")
 )
 
 func init() {
@@ -58,7 +61,7 @@ func setupCloseHandler(exitCh chan struct{}) {
 
 func publish(publishOkCh <-chan struct{}, confirmsCh chan<- *amqp.DeferredConfirmation, confirmsDoneCh <-chan struct{}, exitCh chan struct{}) {
 	config := amqp.Config{
-		Vhost:      "/",
+		Vhost:      "fs_dev",
 		Properties: amqp.NewConnectionProperties(),
 	}
 	config.Properties.SetClientConnectionName("producer-with-confirms")
@@ -118,76 +121,117 @@ func publish(publishOkCh <-chan struct{}, confirmsCh chan<- *amqp.DeferredConfir
 		ErrLog.Fatalf("producer: channel could not be put into confirm mode: %s", err)
 	}
 
+	var scanner *bufio.Scanner
+	var file *os.File
+	if *dataFile != "" {
+		Log.Printf("producer: reading data from file %s", *dataFile)
+		file, err = os.Open(*dataFile)
+		if err != nil {
+			ErrLog.Fatalf("producer: error opening data file %s: %s", *dataFile, err)
+		}
+		defer file.Close()
+		scanner = bufio.NewScanner(file)
+	}
+
 	for {
 		canPublish := false
 		Log.Println("producer: waiting on the OK to publish...")
-		for {
-			select {
-			case <-confirmsDoneCh:
-				Log.Println("producer: stopping, all confirms seen")
-				return
-			case <-publishOkCh:
-				Log.Println("producer: got the OK to publish")
-				canPublish = true
-				break
-			case <-time.After(time.Second):
-				WarnLog.Println("producer: still waiting on the OK to publish...")
+		var body string
+		for i := 0; i < *count; i++ {
+			body = getBodyMsg(i, scanner)
+			if body == "" {
+				if scanner != nil {
+					file.Seek(0, 0)                  // reset the file pointer to the beginning
+					scanner = bufio.NewScanner(file) // reinitialize the scanner
+				}
+				i-- // decrement i to retry this iteration
 				continue
 			}
-			if canPublish {
-				break
-			}
-		}
-
-		Log.Printf("producer: publishing %dB body (%q)", len(*body), *body)
-		dConfirmation, err := channel.PublishWithDeferredConfirm(
-			*exchange,
-			*routingKey,
-			true,
-			false,
-			amqp.Publishing{
-				Headers:         amqp.Table{},
-				ContentType:     "text/plain",
-				ContentEncoding: "",
-				DeliveryMode:    amqp.Persistent,
-				Priority:        0,
-				AppId:           "sequential-producer",
-				Body:            []byte(*body),
-			},
-		)
-		if err != nil {
-			ErrLog.Fatalf("producer: error in publish: %s", err)
-		}
-
-		select {
-		case <-confirmsDoneCh:
-			Log.Println("producer: stopping, all confirms seen")
-			return
-		case confirmsCh <- dConfirmation:
-			Log.Println("producer: delivered deferred confirm to handler")
-			break
-		}
-
-		select {
-		case <-confirmsDoneCh:
-			Log.Println("producer: stopping, all confirms seen")
-			return
-		case <-time.After(time.Millisecond * 250):
-			if *continuous {
-				continue
-			} else {
-				Log.Println("producer: initiating stop")
-				close(exitCh)
+			Log.Printf("producer: publishing %dB body (%q)", len(body), body)
+			for {
 				select {
 				case <-confirmsDoneCh:
 					Log.Println("producer: stopping, all confirms seen")
 					return
-				case <-time.After(time.Second * 10):
-					WarnLog.Println("producer: may be stopping with outstanding confirmations")
-					return
+				case <-publishOkCh:
+					//Log.Println("producer: got the OK to publish")
+					canPublish = true
+					break
+				case <-time.After(time.Second):
+					WarnLog.Println("producer: still waiting on the OK to publish...")
+					continue
+				}
+				if canPublish {
+					break
+				}
+			}
+
+			dConfirmation, err := channel.PublishWithDeferredConfirm(
+				*exchange,
+				*routingKey,
+				true,
+				false,
+				amqp.Publishing{
+					Headers:         amqp.Table{},
+					ContentType:     "text/plain",
+					ContentEncoding: "",
+					DeliveryMode:    amqp.Persistent,
+					Priority:        0,
+					AppId:           "sequential-producer",
+					Body:            []byte(body),
+				},
+			)
+			if err != nil {
+				ErrLog.Fatalf("producer: error in publish: %s", err)
+			}
+
+			select {
+			case <-confirmsDoneCh:
+				Log.Println("producer: stopping, all confirms seen")
+				return
+			case confirmsCh <- dConfirmation:
+				Log.Println("producer: delivered deferred confirm to handler")
+				break
+			}
+
+			select {
+			case <-confirmsDoneCh:
+				Log.Println("producer: stopping, all confirms seen")
+				return
+			case <-time.After(time.Millisecond * 10):
+				if *continuous || i < *count-1 {
+					continue
+				} else {
+					Log.Println("producer: initiating stop")
+					close(exitCh)
+					select {
+					case <-confirmsDoneCh:
+						Log.Println("producer: stopping, all confirms seen")
+						return
+					case <-time.After(time.Second * 10):
+						WarnLog.Println("producer: may be stopping with outstanding confirmations")
+						return
+					}
 				}
 			}
 		}
+	}
+}
+
+func getBodyMsg(i int, scanner *bufio.Scanner) string {
+	if *dataFile != "" {
+		// scan one line from the file
+		if !scanner.Scan() {
+			if scanner.Err() != nil {
+				ErrLog.Printf("producer: error reading from file %s: %s", *dataFile, scanner.Err())
+			} else {
+				log.Printf("producer: end of file %s reached, restarting from the beginning", *dataFile)
+				return "" // return empty string to indicate no more data
+			}
+		}
+		return scanner.Text()
+	} else {
+		return fmt.Sprintf(`{"name": "item-%d", "qty": %d}`, i, i)
 	}
 }
 
@@ -210,7 +254,7 @@ func startConfirmHandler(publishOkCh chan<- struct{}, confirmsCh <-chan *amqp.De
 			if outstandingConfirmationCount <= 8 {
 				select {
 				case publishOkCh <- struct{}{}:
-					Log.Println("confirm handler: sent OK to publish")
+					//Log.Println("confirm handler: sent OK to publish")
 				case <-time.After(time.Second * 5):
 					WarnLog.Println("confirm handler: timeout indicating OK to publish (this should never happen!)")
 				}

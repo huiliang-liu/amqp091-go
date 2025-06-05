@@ -21,7 +21,7 @@ import (
 )
 
 var (
-	uri               = flag.String("uri", "amqp://guest:guest@localhost:5672/", "AMQP URI")
+	uri               = flag.String("uri", "amqp://gpadmin:changeme@localhost:5672/fs_dev", "AMQP URI")
 	exchange          = flag.String("exchange", "test-exchange", "Durable, non-auto-deleted AMQP exchange name")
 	exchangeType      = flag.String("exchange-type", "direct", "Exchange type - direct|fanout|topic|x-custom")
 	queue             = flag.String("queue", "test-queue", "Ephemeral AMQP queue name")
